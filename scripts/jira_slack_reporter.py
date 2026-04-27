@@ -53,12 +53,12 @@ def fetch_new_bugs(since: str) -> list:
         f'ORDER BY created DESC'
     )
 
-    resp = requests.get(
-        f"{JIRA_BASE_URL}/rest/api/3/search",
+    resp = requests.post(
+        f"{JIRA_BASE_URL}/rest/api/3/search/jql",
         auth=(JIRA_EMAIL, JIRA_API_TOKEN),
-        params={
+        json={
             "jql": jql,
-            "fields": "summary,status,priority,reporter,project,created",
+            "fields": ["summary", "status", "priority", "reporter", "project", "created"],
             "maxResults": 50,
         },
     )
