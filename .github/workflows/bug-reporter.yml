@@ -1,0 +1,46 @@
+name: Jira Bug Reporter
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'  # Every 30 minutes
+  workflow_dispatch:         # Allow manual trigger
+
+jobs:
+  report-bugs:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get run timestamp
+        id: ts
+        run: echo "ts=$(date +'%Y%m%d%H%M%S')" >> $GITHUB_OUTPUT
+
+      - name: Restore state cache
+        uses: actions/cache/restore@v4
+        with:
+          path: state/
+          key: jira-state-${{ steps.ts.outputs.ts }}
+          restore-keys: jira-state-
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run bug reporter
+        env:
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+        run: python scripts/jira_slack_reporter.py
+
+      - name: Save state cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state/
+          key: jira-state-${{ steps.ts.outputs.ts }}
