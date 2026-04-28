@@ -28,21 +28,22 @@ PRIORITY_EMOJI = {
 }
 
 
-def load_last_checked() -> str:
+def load_state() -> tuple[str, set]:
     if STATE_FILE.exists():
         data = json.loads(STATE_FILE.read_text())
-        return data["last_checked"]
-    # First run: look back 24 hours
+        return data["last_checked"], set(data.get("reported_ids", []))
     dt = datetime.now(timezone.utc) - timedelta(hours=24)
-    return dt.strftime("%Y-%m-%d %H:%M")
+    return dt.strftime("%Y-%m-%d %H:%M"), set()
 
 
-def save_last_checked(timestamp: str) -> None:
+def save_state(timestamp: str, reported_ids: set) -> None:
     STATE_FILE.parent.mkdir(exist_ok=True)
-    STATE_FILE.write_text(json.dumps({"last_checked": timestamp}))
+    # Keep only last 1000 IDs to prevent unbounded growth
+    ids_list = list(reported_ids)[-1000:]
+    STATE_FILE.write_text(json.dumps({"last_checked": timestamp, "reported_ids": ids_list}))
 
 
-def fetch_new_bugs(since: str) -> list:
+def fetch_bugs(since: str) -> list:
     reporters = ", ".join(f'"{r}"' for r in QA_REPORTERS)
     projects = ", ".join(PROJECTS)
     jql = (
@@ -120,18 +121,22 @@ def post_to_slack(issues: list) -> None:
 
 
 def main() -> None:
-    last_checked = load_last_checked()
+    last_checked, reported_ids = load_state()
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
 
     print(f"Checking for bugs since: {last_checked}")
-    issues = fetch_new_bugs(last_checked)
-    print(f"Found {len(issues)} new bug(s)")
+    all_issues = fetch_bugs(last_checked)
 
-    if issues:
-        post_to_slack(issues)
+    # Filter out already-reported bugs
+    new_issues = [i for i in all_issues if i["key"] not in reported_ids]
+    print(f"Found {len(all_issues)} bug(s), {len(new_issues)} not yet reported")
+
+    if new_issues:
+        post_to_slack(new_issues)
         print("Posted to Slack")
 
-    save_last_checked(now)
+    reported_ids.update(i["key"] for i in new_issues)
+    save_state(now, reported_ids)
     print(f"State saved: {now}")
 
 
