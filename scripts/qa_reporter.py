@@ -21,6 +21,16 @@ QA_REPORTERS = [
 SLACK_CHANNEL = "qa-team-bugs-reported"
 STATE_FILE = Path("state/qa_state.json")
 
+# Re-scan window: every run also re-checks this far back and dedups via
+# reported_ids, so bugs near the boundary (clock skew, timezone edges, bugs
+# created mid-run) are never dropped even if last_checked drifted forward.
+LOOKBACK_MINUTES = 120
+# Keep enough recent IDs to cover the lookback window with wide margin.
+MAX_REPORTED_IDS = 2000
+REQUEST_TIMEOUT = 30
+
+TIME_FMT = "%Y-%m-%d %H:%M"
+
 PRIORITY_EMOJI = {
     "Highest": ":red_circle:",
     "High":    ":large_orange_circle:",
@@ -30,20 +40,45 @@ PRIORITY_EMOJI = {
 }
 
 
-def load_state() -> tuple[str, set]:
-    if STATE_FILE.exists():
-        data = json.loads(STATE_FILE.read_text())
-        return data["last_checked"], set(data.get("reported_ids", []))
+def _default_since() -> str:
     dt = datetime.now(timezone.utc) - timedelta(hours=24)
-    return dt.strftime("%Y-%m-%d %H:%M"), set()
+    return dt.strftime(TIME_FMT)
 
 
-def save_state(timestamp: str, reported_ids: set) -> None:
+def load_state() -> tuple[str, list]:
+    """Return (last_checked, reported_ids). Falls back to a 24h lookback with an
+    empty ID list if the state file is missing or unreadable, rather than
+    crashing the run on a corrupt/truncated cache."""
+    if STATE_FILE.exists():
+        try:
+            data = json.loads(STATE_FILE.read_text())
+            return data["last_checked"], list(data.get("reported_ids", []))
+        except (json.JSONDecodeError, KeyError, OSError) as e:
+            print(f"[QA] WARNING: state file unreadable ({e}); defaulting to 24h lookback")
+    return _default_since(), []
+
+
+def save_state(timestamp: str, reported_ids: list) -> None:
+    """Write state atomically (temp file + replace) so an interrupted run cannot
+    leave a half-written state file behind."""
     STATE_FILE.parent.mkdir(exist_ok=True)
-    STATE_FILE.write_text(json.dumps({
+    tmp = STATE_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps({
         "last_checked": timestamp,
-        "reported_ids": list(reported_ids)[-1000:],
+        "reported_ids": reported_ids[-MAX_REPORTED_IDS:],
     }))
+    tmp.replace(STATE_FILE)
+
+
+def query_since(last_checked: str) -> str:
+    """Apply the lookback buffer to last_checked to produce the JQL lower bound."""
+    try:
+        dt = datetime.strptime(last_checked, TIME_FMT).replace(tzinfo=timezone.utc)
+    except ValueError:
+        print(f"[QA] WARNING: bad last_checked '{last_checked}'; defaulting to 24h lookback")
+        return _default_since()
+    dt -= timedelta(minutes=LOOKBACK_MINUTES)
+    return dt.strftime(TIME_FMT)
 
 
 def fetch_issues(since: str) -> list:
@@ -65,6 +100,7 @@ def fetch_issues(since: str) -> list:
             "fields": ["summary", "status", "priority", "reporter", "project", "created", "issuetype"],
             "maxResults": 50,
         },
+        timeout=REQUEST_TIMEOUT,
     )
     resp.raise_for_status()
     return resp.json().get("issues", [])
@@ -117,6 +153,7 @@ def post_to_slack(issues: list) -> None:
             "text": f":bug: {len(issues)} new bug(s) reported in Jira",
             "blocks": format_slack_blocks(issues),
         },
+        timeout=REQUEST_TIMEOUT,
     )
     resp.raise_for_status()
     data = resp.json()
@@ -126,19 +163,24 @@ def post_to_slack(issues: list) -> None:
 
 def main() -> None:
     last_checked, reported_ids = load_state()
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+    reported_set = set(reported_ids)
+    now = datetime.now(timezone.utc).strftime(TIME_FMT)
+    since = query_since(last_checked)
 
-    print(f"[QA] Checking for bugs since: {last_checked}")
-    all_issues = fetch_issues(last_checked)
-    new_issues = [i for i in all_issues if i["key"] not in reported_ids]
+    print(f"[QA] Checking for bugs since: {since} (last_checked={last_checked})")
+    all_issues = fetch_issues(since)
+    new_issues = [i for i in all_issues if i["key"] not in reported_set]
 
     print(f"[QA] Found {len(all_issues)} bug(s), {len(new_issues)} not yet reported")
 
     if new_issues:
+        # If this raises, we deliberately do NOT advance state below: the next
+        # run re-queries the same window and retries instead of silently
+        # skipping bugs that were never delivered.
         post_to_slack(new_issues)
-        print(f"[QA] Posted to #{SLACK_CHANNEL}")
+        reported_ids.extend(i["key"] for i in new_issues)
+        print(f"[QA] Posted {len(new_issues)} bug(s) to #{SLACK_CHANNEL}")
 
-    reported_ids.update(i["key"] for i in new_issues)
     save_state(now, reported_ids)
     print(f"[QA] State saved: {now}")
 
